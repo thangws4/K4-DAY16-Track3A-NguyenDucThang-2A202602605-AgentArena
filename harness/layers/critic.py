@@ -70,7 +70,44 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers.citation_checker import cited_ids, observed_sources, quotes_a_line
 from harness.middleware import Middleware
+
+#: Chỗ mô hình dán hai nửa câu của hai tài liệu mâu thuẫn.
+JOINER = " và "
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ: các tài liệu đã đọc không chứa thông tin để trả lời "
+    "câu hỏi này một cách chắc chắn."
+)
+
+
+def _split_fused(ctx, claim: dict) -> list | None:
+    """Tách câu ghép tại JOINER thành hai claim thuộc hai tài liệu khác nhau.
+
+    Mỗi nửa là một substring của chữ mô hình viết, nên vẫn giữ provenance.
+    Trả về None nếu không có điểm cắt nào cho hai nửa đều có nguồn.
+    """
+    text = claim["text"]
+    start = text.find(JOINER)
+    while start != -1:
+        left, right = text[:start], text[start + len(JOINER):]
+        if ctx.saw(left) and ctx.saw(right):
+            for left_doc in observed_sources(ctx, left):
+                for right_doc in observed_sources(ctx, right):
+                    if left_doc.doc_id != right_doc.doc_id:
+                        return [
+                            {**claim, "text": left, "doc_id": left_doc.doc_id},
+                            {**claim, "text": right, "doc_id": right_doc.doc_id},
+                        ]
+        start = text.find(JOINER, start + 1)
+    return None
+
+
+def _quoted_somewhere(ctx, text: str) -> bool:
+    """Có tài liệu nào trong corpus chứa `text` trên một dòng không — thiếu
+    điều kiện này thì scorer chấm `HALLUCINATED` dù câu có trong quan sát."""
+    return ctx.corpus is None or any(quotes_a_line(d.body, text) for d in ctx.corpus.docs)
 
 
 class Critic(Middleware):
@@ -79,16 +116,32 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept, dropped, split = [], 0, 0
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str):
+                dropped += 1
+                continue
+            if ctx.saw(text) and _quoted_somewhere(ctx, text):
+                kept.append(claim)
+                continue
+            halves = _split_fused(ctx, claim)
+            if halves is not None:
+                kept.extend(halves)
+                split += 1
+                # Hai nguồn nói hai điều khác nhau: nêu cả hai, không chọn bên.
+                report["abstain"] = True
+            else:
+                dropped += 1
+
+        ctx.state["critic"] = {"kept": len(kept), "dropped": dropped, "split": split}
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = ABSTAIN_ANSWER
+        report["claims"] = kept
+        report["citations"] = cited_ids(kept)
+        return report

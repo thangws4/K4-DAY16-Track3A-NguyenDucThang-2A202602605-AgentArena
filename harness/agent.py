@@ -81,7 +81,11 @@ through the keyword argument that already existed.
 
     ReActAgent(model, tools, trace, system_prompt=ARENA_SYSTEM_PROMPT_REAL)
 
-**THE SCORED, REAL-MODEL PATH MUST CONSTRUCT THE AGENT THAT WAY.**
+**THE SCORED, REAL-MODEL PATH MUST CONSTRUCT THE AGENT THAT WAY.** The
+frozen runner does not — it passes `config.resolved_system_prompt()` — so
+`ReActAgent.__init__` applies `prompt_for_model`: when the model at the
+bottom of the wrapper chain is a `RealModel`, the addendum is appended
+automatically; any other model keeps the prompt it was given.
 
 The DEFAULT is still the bare frozen `ARENA_SYSTEM_PROMPT`, and that is a
 measured decision rather than caution. On `MockModel` the addendum is
@@ -110,6 +114,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    RealModel,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -273,6 +278,38 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: must pass as `system_prompt`; not the default (see the module
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
+
+
+def _wraps_real_model(model) -> bool:
+    """Is a `RealModel` at the bottom of this model's wrapper chain?
+
+    The frozen runner hands the agent a `ProvenanceModel` whose `.inner`
+    is the `MockModel` or `RealModel` it wraps — the same attribute the
+    runner itself checks. Bounded walk, so an odd wrapper cannot loop.
+    """
+    for _ in range(4):
+        if isinstance(model, RealModel):
+            return True
+        model = getattr(model, "inner", None)
+        if model is None:
+            return False
+    return False
+
+
+def prompt_for_model(model, system_prompt: str) -> str:
+    """`system_prompt`, plus the addendum when the model is a real endpoint.
+
+    `arena/runner.py` builds the agent with `config.resolved_system_prompt()`
+    — the bare frozen prompt unless `prompt_addendum` is on — so the
+    real-model path never receives `ARENA_SYSTEM_PROMPT_REAL` through the
+    constructor. Deciding here is the only place student code can make
+    that path carry it. The mock path is left byte-identical.
+    """
+    if not isinstance(system_prompt, str) or not _wraps_real_model(model):
+        return system_prompt
+    if REAL_MODEL_PROMPT_ADDENDUM.strip() in system_prompt:
+        return system_prompt
+    return real_model_system_prompt(system_prompt)
 
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
@@ -480,7 +517,7 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
-        self.system_prompt = system_prompt
+        self.system_prompt = prompt_for_model(model, system_prompt)
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
@@ -692,5 +729,6 @@ __all__ = [
     "MAX_STEPS",
     "ARENA_SYSTEM_PROMPT_REAL",
     "REAL_MODEL_PROMPT_ADDENDUM",
+    "prompt_for_model",
     "real_model_system_prompt",
 ]
